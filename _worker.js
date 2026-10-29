@@ -204,13 +204,25 @@ async function createTunnel(env, { name, zoneId, sub, path, service }) {
     throw e;
   }
 
+  // 优先使用 Cloudflare 官方 token 接口返回的 token, 与官网后台完全一致,
+  // 避免本地拼装的 token 在某些严格校验的脚本里被误判;
+  // 接口失败时回退到本地构造的 token (格式与 cloudflared 一致)
+  let token = null;
+  try {
+    const official = await cf(env, `/accounts/${acc}/cfd_tunnel/${tunnel.id}/token`);
+    token = typeof official === "string" ? official : official && official.token;
+  } catch (e) {
+    token = null;
+  }
+  if (!token) token = btoa(JSON.stringify({ a: acc, t: tunnel.id, s: secret }));
+
   return {
     id: tunnel.id,
     name,
     hostname,
     path: path || "",
     service,
-    token: btoa(JSON.stringify({ a: acc, t: tunnel.id, s: secret })),
+    token,
   };
 }
 
@@ -788,7 +800,7 @@ async function handleApi(request, env, path) {
   const acc = env.cfAcc;
   const base = `/accounts/${acc}/cfd_tunnel`;
 
-  if (["/api/token", "/api/detail", "/api/update", "/api/delete", "/api/alert", "/api/route", "/api/uptime"].includes(path) && !uuid(d.id))
+  if (["/api/token", "/api/token/refresh", "/api/detail", "/api/update", "/api/delete", "/api/alert", "/api/route", "/api/uptime"].includes(path) && !uuid(d.id))
     return json({ error: "隧道 ID 无效" }, 400);
 
   const svcErr = (s) =>
@@ -953,6 +965,24 @@ async function handleApi(request, env, path) {
   }
 
   if (path === "/api/token") return json({ token: await cf(env, `${base}/${d.id}/token`) });
+
+  if (path === "/api/token/refresh") {
+    // 刷新令牌: 生成新密钥 → PATCH 更新隧道 → 取新 token;
+    // 旧令牌无法再建立新连接, 已有连接保持到重启 (与官网"刷新令牌"一致)
+    const secret = b64(crypto.getRandomValues(new Uint8Array(32)));
+    const updated = await cf(env, `${base}/${d.id}`, "PATCH", { tunnel_secret: secret });
+    let token = updated && updated.token;
+    if (!token) {
+      try {
+        const official = await cf(env, `${base}/${d.id}/token`);
+        token = typeof official === "string" ? official : official && official.token;
+      } catch (e) {
+        token = null;
+      }
+    }
+    if (!token) token = btoa(JSON.stringify({ a: acc, t: d.id, s: secret }));
+    return json({ token });
+  }
 
   // 单隧道连接器运行时长: 取各连接器 run_at (连接建立时间) 的最早一条; 列表徽章无需调此接口
   if (path === "/api/uptime") {
@@ -1822,6 +1852,12 @@ function cmds(t){
          codeBox('Linux 运行','cloudflared tunnel run --token '+t)+
          codeBox('Docker 运行','docker run -d --restart always --network host cloudflare/cloudflared:latest tunnel --no-autoupdate run --token '+t);
 }
+function tokenBody(token,id){
+  return cmds(token)+
+    '<div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">'+
+    '<button class="btn" data-refresh-token="'+esc(id)+'">刷新令牌</button>'+
+    '<span class="hint" style="margin:0">刷新后旧令牌无法再建立新连接, 需用新令牌重新部署 cloudflared</span></div>';
+}
 // 域名栏只显示主机名, 不带 https://
 function hostLine(r){
   if(!r){
@@ -2183,6 +2219,16 @@ document.addEventListener('click',function(e){
   if(t.dataset.act==='rmchat')rmChat(t.dataset.chat);
   if(t.dataset.act==='rmdel')rmRoute(t.dataset.host,t.dataset.path);
 });
+document.addEventListener('click',async function(e){
+  var t=e.target.closest('[data-refresh-token]');if(!t)return;
+  var id=t.dataset.refreshToken;
+  if(!(await askConfirm('刷新后旧令牌无法再建立新连接, 正在运行的 cloudflared 需要用新令牌重新部署。确认刷新吗?','刷新令牌','确认刷新')))return;
+  try{
+    var d=await api('/api/token/refresh',{id:id});
+    $('t_body').innerHTML=tokenBody(d.token,id);
+    toast('令牌已刷新, 请用新令牌重新部署 cloudflared');
+  }catch(err){fail(err)}
+});
 
 async function toggleAlert(id,on,up){
   try{
@@ -2259,7 +2305,7 @@ function showToken(r,token,fresh){
           return '<div class="code"><span class="hintcp">⧉ 点击复制</span><pre style="max-height:none" data-copy="'+esc(x.hostname)+'">'+esc(x.hostname)+(x.path?'<span style="color:#8b93a0"> · '+esc(x.path)+'</span>':'')+'</pre></div>';
         }).join('<div style="height:8px"></div>');
     })();
-  $('t_body').innerHTML=cmds(token);
+  $('t_body').innerHTML=tokenBody(token,r.id);
   openModal('mToken');
 }
 async function showTk(id,name){
