@@ -5,6 +5,7 @@
 //        整个账户：DNS & Zone → Account DNS Settings → Read & Edit；DNS View → Read & Edit;
 //                 Argo Tunnel → Read & Edit；
 //        所有域名：DNS & Zone → DNS → Read & Edit;Zone → Read & Edit;Zone DNS Settings → Read & Edit;Zone Settings → Read & Edit;
+//                 Zone → Origin → Read & Edit（CDN 回源规则用；没有它时规则接口会报权限不足）;
 
 //   PASSWORD         登录密码 (必填), 至少 6 位
 //   SESSION_SECRET   会话签名密钥 (可选), 推荐设置一串随机字符，否则自动由 PASSWORD 派生 (改密码后所有人需重新登录)
@@ -52,7 +53,7 @@ const API = "https://api.cloudflare.com/client/v4";
 const ZH_ERRORS = [
   [/already have a tunnel with this name/i, "已存在同名隧道,请删除原隧道或换一个名称"],
   [/authentication error|valid user-level authentication|invalid api token|unauthorized/i,
-    "API 令牌无效或权限不足,请确认已授予:帐户 Cloudflare Tunnel 编辑、区域 DNS 编辑、区域 区域 读取"],
+    "API 令牌无效或权限不足,请确认已授予:帐户 Cloudflare Tunnel 编辑、区域 DNS 编辑、区域 区域 读取、区域 Origin 编辑（CDN 回源规则）"],
   [/invalid format for authorization header|invalid request headers/i,
     "API 令牌格式不正确,请检查 CF_API_TOKEN 是否复制完整"],
   [/could not route|object identifier is invalid/i, "账户 ID 或区域 ID 不正确,请检查 CF_ACCOUNT_ID"],
@@ -175,6 +176,51 @@ async function getRules(env, base, id) {
   const c = await cf(env, `${base}/${id}/configurations`);
   const config = (c && c.config) || {};
   return { config, ingress: (config.ingress || []).slice() };
+}
+
+// ---- CDN 回源: Origin 规则 (http_request_origin 阶段) ----
+// 面板只生成两种表达式, 列表时可还原:
+//   精确域名: http.host eq "example.com"
+//   泛域名: ends_with(http.host, ".example.com")  (面板输入 *.example.com)
+function cdnParseExpr(expr) {
+  let m = /^\s*http\.host eq "([^"]+)"\s*$/.exec(expr || "");
+  if (m) return { host: m[1], wildcard: false };
+  m = /^\s*ends_with\(http\.host,\s*"(\.[^"]+)"\)\s*$/.exec(expr || "");
+  if (m) return { host: "*" + m[1], wildcard: true };
+  return { host: "", wildcard: false };
+}
+function cdnRuleView(r) {
+  const p = cdnParseExpr(r.expression || "");
+  const o = (r.action_parameters && r.action_parameters.origin) || {};
+  return {
+    id: r.id || "",
+    host: p.host,
+    wildcard: p.wildcard,
+    expression: r.expression || "",
+    description: r.description || "",
+    port: o.port || null,
+    originHost: o.host || "",
+  };
+}
+function cdnRuleSend(r) {
+  // 回写规则集时只保留 API 接受的字段 (去掉 last_updated/version 等只读字段);
+  // enabled 若原规则带则保留, 新规则不写 (默认启用)
+  const o = { description: r.description || "", expression: r.expression, action: r.action, action_parameters: r.action_parameters || {} };
+  if (r.id) o.id = r.id;
+  if (r.ref) o.ref = r.ref;
+  if (typeof r.enabled !== "undefined") o.enabled = r.enabled;
+  return o;
+}
+async function cdnOriginEntry(env, zoneId) {
+  const list = await cf(env, `/zones/${zoneId}/rulesets?per_page=100`);
+  const arr = Array.isArray(list) ? list : [];
+  return arr.find((r) => r.phase === "http_request_origin") || null;
+}
+async function cdnOriginFull(env, zoneId) {
+  const entry = await cdnOriginEntry(env, zoneId);
+  if (!entry) return { entry: null, rules: [] };
+  const full = await cf(env, `/zones/${zoneId}/rulesets/${entry.id}`);
+  return { entry, full, rules: full.rules || [] };
 }
 
 async function createTunnel(env, { name, zoneId, sub, path, service }) {
@@ -1157,6 +1203,125 @@ async function handleApi(request, env, path) {
     return json({ ok: true, ...clean });
   }
 
+  // ---- CDN 回源: 域名解析 + Origin 回源端口规则 ----
+  // 域名解析: 给 VPS 的回源域名建 A/CNAME (默认小黄云代理, 规则才生效); 绝不覆盖已有记录
+  // 回源规则: http_request_origin 阶段的 Origin 规则, 匹配域名后把回源端口改成指定端口 (默认 8080, 即 sing-box 的 nginx_pt)
+  if (path === "/api/cdn") {
+    const action = str(d.action) || "dns_list";
+    const zoneId = str(d.zoneId);
+    if (!zoneId) return json({ error: "请选择域名" }, 400);
+
+    if (action === "dns_list") {
+      const recs = [];
+      for (let page = 1; page <= 5; page++) {
+        const r = await cf(env, `/zones/${zoneId}/dns_records?per_page=100&page=${page}`);
+        const arr = Array.isArray(r) ? r : [];
+        recs.push(...arr.map((x) => ({ id: x.id, type: x.type, name: x.name, content: x.content, proxied: !!x.proxied })));
+        if (arr.length < 100) break;
+      }
+      return json({ records: recs });
+    }
+
+    if (action === "dns_add") {
+      const type = str(d.type).toUpperCase();
+      const sub = str(d.sub).replace(/\.$/, "");
+      const zone = await cf(env, `/zones/${zoneId}`);
+      const name = sub ? `${sub}.${zone.name}` : zone.name;
+      const content = str(d.content);
+      if (type !== "A" && type !== "CNAME") return json({ error: "解析类型仅支持 A / CNAME" }, 400);
+      if (!content) return json({ error: "请填写记录值" }, 400);
+      if (type === "A" && !/^\d{1,3}(\.\d{1,3}){3}$/.test(content)) return json({ error: "A 记录值应为 IPv4 地址" }, 400);
+      if (type === "CNAME" && !/^[A-Za-z0-9.-]+\.[A-Za-z0-9.-]+$/.test(content)) return json({ error: "CNAME 记录值应为域名" }, 400);
+      const exist = await cf(env, `/zones/${zoneId}/dns_records?type=${type}&name=${encodeURIComponent(name)}`);
+      if ((Array.isArray(exist) ? exist : []).length) return json({ error: "该域名已有同类型 DNS 记录, 请先删除再添加" }, 400);
+      const rec = await cf(env, `/zones/${zoneId}/dns_records`, "POST", {
+        type,
+        name,
+        content,
+        proxied: d.proxied !== false && d.proxied !== "0" && d.proxied !== 0,
+        ttl: 1,
+      });
+      return json({ ok: true, record: { id: rec.id, type: rec.type, name: rec.name, content: rec.content, proxied: !!rec.proxied } });
+    }
+
+    if (action === "dns_del") {
+      if (!str(d.recordId)) return json({ error: "缺少记录 ID" }, 400);
+      await cf(env, `/zones/${zoneId}/dns_records/${str(d.recordId)}`, "DELETE");
+      return json({ ok: true });
+    }
+
+    if (action === "origin_list") {
+      const { rules } = await cdnOriginFull(env, zoneId);
+      return json({ rules: rules.map(cdnRuleView) });
+    }
+
+    if (action === "origin_add") {
+      const rawHost = str(d.host).toLowerCase().replace(/\.$/, "");
+      let port = parseInt(str(d.port), 10);
+      if (!port || port < 1 || port > 65535) port = 8080;
+      const originHost = str(d.originHost).toLowerCase().replace(/\.$/, "");
+      let expression, host;
+      if (rawHost.startsWith("*.")) {
+        const base = rawHost.slice(2);
+        if (!/^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/.test(base)) return json({ error: "泛域名格式不正确, 例如 *.example.com" }, 400);
+        expression = `ends_with(http.host, ".${base}")`;
+        host = rawHost;
+      } else {
+        if (!/^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/.test(rawHost)) return json({ error: "域名格式不正确" }, 400);
+        expression = `http.host eq "${rawHost}"`;
+        host = rawHost;
+      }
+      const { entry, full, rules } = await cdnOriginFull(env, zoneId);
+      if (rules.some((r) => cdnParseExpr(r.expression || "").host === host))
+        return json({ error: "该域名已有回源规则, 请先删除再添加" }, 400);
+      const origin = { port };
+      if (originHost) origin.host = originHost;
+      const rule = {
+        description: `面板CDN回源: ${host} → ${port}`,
+        expression,
+        action: "route",
+        action_parameters: { origin },
+      };
+      let saved;
+      if (entry) {
+        const body = { rules: [...rules.map(cdnRuleSend), rule] };
+        if (full.name) body.name = full.name;
+        if (full.description) body.description = full.description;
+        saved = await cf(env, `/zones/${zoneId}/rulesets/${entry.id}`, "PUT", body);
+      } else {
+        saved = await cf(env, `/zones/${zoneId}/rulesets`, "POST", {
+          kind: "zone",
+          name: "CDN 回源（面板）",
+          phase: "http_request_origin",
+          rules: [rule],
+        });
+      }
+      return json({ ok: true, rules: (saved.rules || []).map(cdnRuleView) });
+    }
+
+    if (action === "origin_del") {
+      const ruleId = str(d.ruleId);
+      if (!ruleId) return json({ error: "缺少规则 ID" }, 400);
+      const { entry, full, rules } = await cdnOriginFull(env, zoneId);
+      if (!entry) return json({ error: "规则不存在" }, 404);
+      const rest = rules.filter((r) => r.id !== ruleId);
+      if (rest.length === rules.length) return json({ error: "规则不存在" }, 404);
+      let out = [];
+      if (!rest.length) {
+        await cf(env, `/zones/${zoneId}/rulesets/${entry.id}`, "DELETE");
+      } else {
+        const body = { rules: rest.map(cdnRuleSend) };
+        if (full.name) body.name = full.name;
+        if (full.description) body.description = full.description;
+        const saved = await cf(env, `/zones/${zoneId}/rulesets/${entry.id}`, "PUT", body);
+        out = (saved.rules || []).map(cdnRuleView);
+      }
+      return json({ ok: true, rules: out });
+    }
+
+    return json({ error: "未知操作" }, 400);
+  }
+
   return json({ error: "未知接口" }, 404);
 }
 
@@ -1605,6 +1770,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
     <nav class="nav">
       <a data-v="dash" class="on"><span class="i"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg></span>仪表板</a>
       <a data-v="tunnels"><span class="i"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19a4.5 4.5 0 1 0-.42-8.98 6 6 0 1 0-11.06 3.1A3.5 3.5 0 0 0 6.5 19Z"/><path d="M9 12v4"/><path d="m9 12 6-3"/><circle cx="15" cy="9" r=".8" fill="currentColor" stroke="none"/></svg></span>Tunnel 管理</a>
+      <a data-v="cdn"><span class="i"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14.5 14.5 0 0 1 0 18M12 3a14.5 14.5 0 0 0 0 18"/></svg></span>CDN 回源</a>
       <a data-v="tg"><span class="i"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg></span>Telegram 配置</a>
     </nav>
     <div class="foot"><a href="#" id="logout"><span class="i"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M5 21c0-3.9 3.1-7 7-7s7 3.1 7 7"/></svg></span><span class="lt">退出登录</span><span class="lo">⇥</span></a></div>
@@ -1663,6 +1829,42 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
         <div class="card">
           <h3><span>隧道列表</span><span class="hint" id="sum" style="margin:0"></span></h3>
           <div id="list"><div class="empty">加载中...</div></div>
+        </div>
+      </section>
+
+      <section class="view" id="v-cdn">
+        <div class="card">
+          <h3><span>域名解析</span><span class="hint" style="margin:0">给 VPS 的回源域名建解析, 必须开小黄云代理, 回源规则才生效</span></h3>
+          <label>域名</label>
+          <select id="cdn_zone" class="zone"></select>
+          <div id="cdn_dns" class="rtable"><div class="empty">请选择域名</div></div>
+          <div style="border-top:1px solid var(--line);margin-top:12px;padding-top:4px">
+            <div class="hint" style="margin-top:8px;font-weight:600;color:var(--text)">新增解析</div>
+            <label>子域名 (可空, 如 cdn)</label>
+            <input id="cdn_sub" placeholder="留空则解析到域名本身" autocapitalize="off" autocomplete="off">
+            <label>类型 / 记录值</label>
+            <div class="row">
+              <select id="cdn_type" class="zone"><option value="A">A</option><option value="CNAME">CNAME</option></select>
+              <input id="cdn_content" class="sub" placeholder="A 填 VPS 的 IPv4, CNAME 填目标域名" autocapitalize="off" autocomplete="off" spellcheck="false">
+            </div>
+            <label style="display:flex;gap:8px;align-items:center;margin-top:10px;font-weight:400"><input type="checkbox" id="cdn_proxied" checked style="width:auto"> 小黄云代理 (走 CDN, 回源规则必需)</label>
+            <div class="btns"><button class="btn" id="cdn_dns_add">＋ 添加解析</button></div>
+          </div>
+        </div>
+        <div class="card">
+          <h3><span>回源端口规则</span><span class="hint" style="margin:0">Origin 规则: 匹配域名后, 回源端口改成指定端口</span></h3>
+          <div class="hint">令牌需加 Zone → Origin → Edit 权限。泛域名用 *.example.com, 匹配该域名下所有子域名。端口默认 8080, 即 sing-box 的 nginx_pt。</div>
+          <div id="cdn_rules" class="rtable"><div class="empty">请选择域名</div></div>
+          <div style="border-top:1px solid var(--line);margin-top:12px;padding-top:4px">
+            <div class="hint" style="margin-top:8px;font-weight:600;color:var(--text)">新增规则</div>
+            <label>匹配域名 (支持 *.example.com 泛域名)</label>
+            <input id="cdn_host" placeholder="如 cdn.example.com 或 *.example.com" autocapitalize="off" autocomplete="off" spellcheck="false">
+            <label>回源端口</label>
+            <input id="cdn_port" placeholder="8080" inputmode="numeric" autocomplete="off">
+            <label>回源主机 (可选, 留空=只改端口)</label>
+            <input id="cdn_ohost" placeholder="留空则只改端口, 不改回源主机" autocapitalize="off" autocomplete="off" spellcheck="false">
+            <div class="btns"><button class="btn" id="cdn_rule_add">＋ 添加规则</button></div>
+          </div>
         </div>
       </section>
 
@@ -1932,6 +2134,7 @@ $('acc_sel').addEventListener('change',async function(){
     curAcc=v;renderAccSel({accounts:Object.keys(accNames).map(function(k){return {name:accNames[k],acc:k}}),cur:v});
     metaCache={}; // 新账号路由缓存清空
     await Promise.all([loadList(),initZones()]); // 列表 + 域名下拉都随账号刷新
+    if(curView==='cdn')loadCdn();
   }finally{setBusy(false)}
   loadTg();
   loadMeta();
@@ -2039,12 +2242,12 @@ function show(v){
   curView=v;
   document.querySelectorAll('.nav a').forEach(function(a){a.className=a.dataset.v===v?'on':''});
   document.querySelectorAll('.view').forEach(function(s){s.className='view'+(s.id==='v-'+v?' on':'')});
-  $('ttl').textContent=({dash:'仪表板',tunnels:'Tunnel 管理',tg:'Telegram 配置'})[v]||'';
+  $('ttl').textContent=({dash:'仪表板',tunnels:'Tunnel 管理',cdn:'CDN 回源',tg:'Telegram 配置'})[v]||'';
   $('sidenav').className='sidenav';
   applyFit();
 }
 window.addEventListener('resize',applyFit);
-document.querySelectorAll('.nav a').forEach(function(a){a.onclick=function(){show(a.dataset.v)}});
+document.querySelectorAll('.nav a').forEach(function(a){a.onclick=function(){show(a.dataset.v);if(a.dataset.v==='cdn')loadCdn()}});
 $('brandHome').onclick=function(){show('dash');location.hash=''};
 $('menu').onclick=function(){$('sidenav').className='sidenav open'};
 $('logout').onclick=async function(e){
@@ -2261,9 +2464,11 @@ async function initZones(){
     if(d.dist)renderDist(d.dist);
     if(d.service){defaultSvc=d.service;$('svc').value=d.service;}
     $('zone').innerHTML=d.zones.length?d.zones.map(function(z){return '<option value="'+esc(z.id)+'">.'+esc(z.name)+'</option>'}).join(''):'<option value="">无可用域名</option>';
+    if($('cdn_zone'))$('cdn_zone').innerHTML=d.zones.length?d.zones.map(function(z){return '<option value="'+esc(z.id)+'">'+esc(z.name)+'</option>'}).join(''):'<option value="">无可用域名</option>';
     preview();
   }catch(e){
     $('zone').innerHTML='<option value="">加载失败</option>';
+    if($('cdn_zone'))$('cdn_zone').innerHTML='<option value="">加载失败</option>';
     fail(e);
   }
 }
@@ -2545,11 +2750,80 @@ var savedTheme='';
 try{savedTheme=localStorage.getItem('theme')||''}catch(e){}
 applyTheme(savedTheme);
 
+/* ---- CDN 回源 ---- */
+async function loadCdn(){
+  var z=$('cdn_zone').value;
+  if(!z){$('cdn_dns').innerHTML='<div class="empty">请选择域名</div>';$('cdn_rules').innerHTML='<div class="empty">请选择域名</div>';return}
+  $('cdn_dns').innerHTML='<div class="empty">加载中...</div>';
+  $('cdn_rules').innerHTML='<div class="empty">加载中...</div>';
+  try{
+    var d=await api('/api/cdn',{action:'dns_list',zoneId:z});
+    $('cdn_dns').innerHTML=(d.records||[]).map(function(r){
+      return '<div class="rt">'+
+        '<div class="rh"><b>'+esc(r.type)+'</b> '+esc(r.name)+' → '+esc(r.content)+'</div>'+
+        '<div class="rs">'+(r.proxied?'已代理':'仅 DNS')+'</div>'+
+        '<button class="btn sm red" data-cdndel="'+esc(r.id)+'">删除</button>'+
+        '</div>';
+    }).join('')||'<div class="empty">该域名下暂无解析记录</div>';
+  }catch(e){$('cdn_dns').innerHTML='<div class="empty">加载失败</div>';fail(e)}
+  try{
+    var d2=await api('/api/cdn',{action:'origin_list',zoneId:z});
+    $('cdn_rules').innerHTML=(d2.rules||[]).map(function(r){
+      return '<div class="rt">'+
+        '<div class="rh"><b>'+esc(r.host||r.expression)+'</b></div>'+
+        '<div class="rs">端口 '+(r.port==null?'(仅改主机)':esc(r.port))+(r.originHost?' · '+esc(r.originHost):'')+'</div>'+
+        '<button class="btn sm red" data-cdnrdel="'+esc(r.id)+'">删除</button>'+
+        '</div>';
+    }).join('')||'<div class="empty">暂无回源规则</div>';
+  }catch(e){$('cdn_rules').innerHTML='<div class="empty">加载失败</div>';fail(e)}
+}
+$('cdn_zone').addEventListener('change',loadCdn);
+$('cdn_dns_add').onclick=async function(){
+  var b=this,z=$('cdn_zone').value;
+  if(!z){toast('请先选择域名','err');return}
+  if(!$('cdn_content').value.trim()){toast('请填写记录值','err');return}
+  b.disabled=true;b.innerHTML='<span class="spin"></span> 添加中';
+  try{
+    await api('/api/cdn',{action:'dns_add',zoneId:z,sub:$('cdn_sub').value.trim(),type:$('cdn_type').value,content:$('cdn_content').value.trim(),proxied:$('cdn_proxied').checked});
+    toast('解析已添加');
+    $('cdn_sub').value='';$('cdn_content').value='';
+    loadCdn();
+  }catch(e){fail(e)}
+  b.disabled=false;b.innerHTML='＋ 添加解析';
+};
+$('cdn_rule_add').onclick=async function(){
+  var b=this,z=$('cdn_zone').value;
+  if(!z){toast('请先选择域名','err');return}
+  if(!$('cdn_host').value.trim()){toast('请填写匹配域名','err');return}
+  b.disabled=true;b.innerHTML='<span class="spin"></span> 添加中';
+  try{
+    await api('/api/cdn',{action:'origin_add',zoneId:z,host:$('cdn_host').value.trim(),port:$('cdn_port').value.trim(),originHost:$('cdn_ohost').value.trim()});
+    toast('回源规则已添加');
+    $('cdn_host').value='';$('cdn_port').value='';$('cdn_ohost').value='';
+    loadCdn();
+  }catch(e){fail(e)}
+  b.disabled=false;b.innerHTML='＋ 添加规则';
+};
+document.addEventListener('click',async function(e){
+  var t=e.target.closest('[data-cdndel]');
+  if(t){
+    if(!(await askConfirm('确定删除这条解析记录?','删除解析','删除')))return;
+    try{await api('/api/cdn',{action:'dns_del',zoneId:$('cdn_zone').value,recordId:t.dataset.cdndel});toast('已删除');loadCdn()}catch(err){fail(err)}
+    return;
+  }
+  var t2=e.target.closest('[data-cdnrdel]');
+  if(t2){
+    if(!(await askConfirm('确定删除这条回源规则?','删除规则','删除')))return;
+    try{await api('/api/cdn',{action:'origin_del',zoneId:$('cdn_zone').value,ruleId:t2.dataset.cdnrdel});toast('已删除');loadCdn()}catch(err){fail(err)}
+  }
+});
+
 /* ---- 启动 ---- */
 show((location.hash||'').replace('#','')||'dash');
 initZones().catch(function(){}).then(loadAccs).then(function(){
   loadList().then(loadMeta);
   loadTg();
+  if(curView==='cdn')loadCdn();
 });
 if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js',{scope:'/'}).catch(function(){});
 </script></body></html>`;
