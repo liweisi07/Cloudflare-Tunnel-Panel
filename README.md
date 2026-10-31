@@ -11,6 +11,7 @@ Cloudflare Worker部署的Argo tunnel网页管理面板，用于管理多账户�
 - **隧道管理**：列表展示所有隧道及状态（在线/降级/离线/未启用 + 运行时长）、搜索过滤、查看启动 Token、修改名称与本地服务地址（多路由可选要编辑的那条）、删除隧道。
 - **新建隧道**：选择域名 (Zone)、子域名、可选路径、本地服务地址（如 `http://localhost:8080`、`tcp://localhost:22`），自动创建隧道并自动配置 DNS CNAME 记录。
 - **多路由管理**：在已有隧道上增删"域名 + 路径 → 服务"的 ingress 规则（每条隧道最多 60 条），自动处理 DNS，冲突时拒绝写入。
+- **CDN 回源**：左侧"CDN 回源"里操作 VPS 的域名解析和回源端口规则。域名解析：给回源域名建 A/CNAME（默认小黄云代理，规则才生效），绝不覆盖已有记录；回源端口规则：Origin 规则，匹配域名（支持 `*.example.com` 泛域名）后把回源端口改成指定端口（默认 8080，即 sing-box 的 nginx_pt），不用再去 Cloudflare 后台手动建 origin rule。令牌需另加区域级 `Origin → Edit` 权限。
 - **Telegram 上下线提醒**：状态**发生变化**才推送（上线一次、离线一次），可按隧道逐个开关（**默认关闭**）；支持多个接收者（私聊/群组/频道）、暂停/恢复推送。
 - **PWA**：可安装到桌面/手机主屏，带离线壳页面。
 
@@ -55,6 +56,7 @@ Cloudflare Worker部署的Argo tunnel网页管理面板，用于管理多账户�
 | DNS & Zones | Zone | Read + Edit |
 | DNS & Zones | Zone DNS Settings | Read + Edit |
 | DNS & Zones | Zone Settings | Read + Edit |
+| Zone | Origin | Read + Edit（CDN 回源规则用，没有它时规则接口会报权限不足） |
 
 > 最小可用集其实只需：账户级 `Cloudflare Tunnel → Edit` + 区域级 `DNS → Read/Edit`、`Zone → Read`；多勾的项是无害的冗余。常见错误是只配了账户级的 Account DNS Settings/DNS View（管的是账户 DNS 全局设置，不是 Zone 里的 DNS 记录），会导致面板报"该域名已存在 DNS 记录"或删除隧道后 DNS 清理失败——**区域级的 `DNS → Edit` 必须有**。
 
@@ -116,6 +118,7 @@ KV 有每日写入次数限制且存在最终一致延迟（写后立刻读可�
 | `/api/token` | 获取隧道启动 Token（cloudflared 用） |
 | `/api/uptime` | 连接器运行时长（官方后台"运行时间"同源，用于在线徽章"在线 4d"） |
 | `/api/detail` `/api/route` | 查看 / 增删隧道 ingress 路由 |
+| `/api/cdn` | CDN 回源：域名解析增删查、Origin 回源端口规则增删查 |
 | `/api/alert` | 隧道提醒开关 (toggle) / 吞掉一次变化 (skip) |
 | `/api/tg` | Telegram 配置：保存、测试、增删接收者、暂停/恢复 |
 | `/api/acc` | 多账号：列表 (list) / 添加 (add, 先验证) / 删除 (del) / 切换 (switch) |
