@@ -183,9 +183,9 @@ async function getRules(env, base, id) {
 //   精确域名: http.host eq "example.com"
 //   泛域名: ends_with(http.host, ".example.com")  (面板输入 *.example.com)
 function cdnParseExpr(expr) {
-  let m = /^\s*http\.host eq "([^"]+)"\s*$/.exec(expr || "");
+  let m = /^\s*\(?\s*http\.host eq "([^"]+)"\s*\)?\s*$/.exec(expr || "");
   if (m) return { host: m[1], wildcard: false };
-  m = /^\s*ends_with\(http\.host,\s*"(\.[^"]+)"\)\s*$/.exec(expr || "");
+  m = /^\s*\(?\s*ends_with\(http\.host,\s*"(\.[^"]+)"\)\s*\)?\s*$/.exec(expr || "");
   if (m) return { host: "*" + m[1], wildcard: true };
   return { host: "", wildcard: false };
 }
