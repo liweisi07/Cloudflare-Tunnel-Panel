@@ -384,6 +384,96 @@ async function checkSession(env, value) {
   return diff === 0;
 }
 
+// ---- TOTP 双重验证 (RFC 6238, 验证器 App 6 位动态码 + 一次性恢复码) ----
+// 存储: 面板内开启的密钥与恢复码哈希存在存储键 totp:settings (D1 TUNNEL_DB 或 KV TUNNEL_STATE);
+// 环境变量 TOTP_SECRET 可直接指定密钥 (此时面板内无法开关); TOTP_DISABLED=1 紧急关闭 (防锁死兜底)。
+const TOTP_KEY = "totp:settings";
+const B32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+function base32Encode(bytes) {
+  let out = "", bits = 0, value = 0;
+  for (let i = 0; i < bytes.length; i++) {
+    value = (value << 8) | bytes[i]; bits += 8;
+    while (bits >= 5) { out += B32[(value >>> (bits - 5)) & 31]; bits -= 5; }
+  }
+  if (bits > 0) out += B32[(value << (5 - bits)) & 31];
+  return out;
+}
+function base32Decode(s) {
+  const map = {};
+  for (let i = 0; i < 32; i++) map[B32[i]] = i;
+  let bits = 0, value = 0;
+  const out = [];
+  for (const ch of s.toUpperCase().replace(/=+$/, "")) {
+    if (!(ch in map)) throw new Error("密钥格式不正确");
+    value = (value << 5) | map[ch]; bits += 5;
+    if (bits >= 8) { out.push((value >>> (bits - 8)) & 255); bits -= 8; }
+  }
+  return new Uint8Array(out);
+}
+async function hotpCode(secretBytes, counter) {
+  const key = await crypto.subtle.importKey("raw", secretBytes, { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
+  const msg = new ArrayBuffer(8);
+  const dv = new DataView(msg);
+  dv.setUint32(0, Math.floor(counter / 0x100000000));
+  dv.setUint32(4, counter >>> 0);
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, msg));
+  const off = sig[sig.length - 1] & 0xf;
+  const code = (((sig[off] & 0x7f) << 24) | (sig[off + 1] << 16) | (sig[off + 2] << 8) | sig[off + 3]) % 1000000;
+  return String(code).padStart(6, "0");
+}
+async function totpVerify(secret, code, window = 1) {
+  let bytes;
+  try { bytes = base32Decode(secret); } catch (e) { return false; }
+  const step = Math.floor(Date.now() / 30000);
+  for (let i = -window; i <= window; i++) {
+    if ((await hotpCode(bytes, step + i)) === code) return true;
+  }
+  return false;
+}
+async function sha256hex(text) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+function totpRandomSecret() {
+  const b = new Uint8Array(20);
+  crypto.getRandomValues(b);
+  return base32Encode(b);
+}
+function totpRecoveryCodes() {
+  const arr = [];
+  while (arr.length < 10) {
+    const b = new Uint8Array(4);
+    crypto.getRandomValues(b);
+    const n = ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0;
+    const c = String(n % 100000000).padStart(8, "0");
+    if (!arr.includes(c)) arr.push(c);
+  }
+  return arr;
+}
+async function totpState(env) {
+  if (/^(1|true)$/i.test(str(env.TOTP_DISABLED))) return { enabled: false, envDisabled: true, source: "env", saved: null };
+  if (str(env.TOTP_SECRET)) return { enabled: true, source: "env", secret: str(env.TOTP_SECRET), saved: null };
+  const saved = (await storeGet(env, TOTP_KEY)) || {};
+  if (saved.enabled && saved.secret) return { enabled: true, source: "panel", secret: saved.secret, saved, recoveryLeft: (saved.recoveryHashes || []).length };
+  return { enabled: false, source: "panel", saved, pending: !!saved.pendingSecret };
+}
+// 校验动态码; 面板模式下恢复码也可通过 (命中即消耗一张)
+async function totpCheckCode(env, ts, code) {
+  code = str(code).replace(/[\s-]/g, "");
+  if (!code) return false;
+  if (await totpVerify(ts.secret, code)) return true;
+  if (ts.source === "panel" && ts.saved) {
+    const hash = await sha256hex(code);
+    const idx = (ts.saved.recoveryHashes || []).indexOf(hash);
+    if (idx >= 0) {
+      ts.saved.recoveryHashes.splice(idx, 1);
+      await storePut(env, TOTP_KEY, ts.saved);
+      return true;
+    }
+  }
+  return false;
+}
+
 function cookieValue(request, name) {
   for (const part of (request.headers.get("Cookie") || "").split(";")) {
     const i = part.indexOf("=");
@@ -722,6 +812,15 @@ async function handleApi(request, env, path) {
       await new Promise((r) => setTimeout(r, 500)); // 放慢暴力尝试
       return json({ error: "密码错误" }, 401);
     }
+    const ts = await totpState(env);
+    if (ts.enabled) {
+      const code = str(d.code).replace(/[\s-]/g, "");
+      if (!code) return json({ error: "need_totp" }, 401);
+      if (!(await totpCheckCode(env, ts, code))) {
+        await new Promise((r) => setTimeout(r, 500));
+        return json({ error: "动态码不正确" }, 401);
+      }
+    }
     return new Response(JSON.stringify({ ok: true }), {
       headers: { "Content-Type": "application/json", "Set-Cookie": setCookie(await makeSession(env), SESSION_TTL) },
     });
@@ -733,6 +832,48 @@ async function handleApi(request, env, path) {
 
   // 以下接口都需要登录
   if (!(await checkSession(env, cookieValue(request, COOKIE)))) return json({ error: "请先登录" }, 401);
+
+  if (path === "/api/totp") {
+    const action = str(d.action) || "status";
+    const ts = await totpState(env);
+    if (action === "status") {
+      return json({ enabled: ts.enabled, source: ts.source, envDisabled: !!ts.envDisabled, hasStore: !!store(env), recoveryLeft: ts.recoveryLeft || 0, pending: !!ts.pending });
+    }
+    if (ts.envDisabled || ts.source === "env") return json({ error: "当前双重验证由环境变量控制, 请改 Worker 变量" }, 400);
+    if (!store(env)) return json({ error: "需先配置存储 (D1 TUNNEL_DB 或 KV TUNNEL_STATE) 才能在面板内开启" }, 400);
+    if (action === "setup") {
+      if (ts.enabled) return json({ error: "双重验证已开启, 请先关闭再重新设置" }, 400);
+      const secret = totpRandomSecret();
+      const saved = (await storeGet(env, TOTP_KEY)) || {};
+      await storePut(env, TOTP_KEY, { ...saved, pendingSecret: secret, enabled: false });
+      return json({ ok: true, secret, otpauth: `otpauth://totp/Argo%20Control?secret=${secret}&issuer=Argo%20Control` });
+    }
+    if (action === "verify_setup") {
+      const saved = (await storeGet(env, TOTP_KEY)) || {};
+      if (!saved.pendingSecret) return json({ error: "请先生成密钥" }, 400);
+      if (!(await totpVerify(saved.pendingSecret, str(d.code).replace(/[\s-]/g, "")))) return json({ error: "动态码不正确, 请核对验证器 App 上的 6 位码" }, 400);
+      const codes = totpRecoveryCodes();
+      const hashes = [];
+      for (const c of codes) hashes.push(await sha256hex(c));
+      await storePut(env, TOTP_KEY, { secret: saved.pendingSecret, enabled: true, recoveryHashes: hashes });
+      return json({ ok: true, recovery: codes });
+    }
+    if (action === "disable" || action === "regen") {
+      if (!ts.enabled) return json({ error: "双重验证未开启" }, 400);
+      if (!(await totpCheckCode(env, ts, str(d.code)))) return json({ error: "动态码不正确" }, 400);
+      if (action === "disable") {
+        await storeDel(env, TOTP_KEY);
+        return json({ ok: true });
+      }
+      const codes = totpRecoveryCodes();
+      const hashes = [];
+      for (const c of codes) hashes.push(await sha256hex(c));
+      const saved = (await storeGet(env, TOTP_KEY)) || {};
+      await storePut(env, TOTP_KEY, { ...saved, recoveryHashes: hashes });
+      return json({ ok: true, recovery: codes });
+    }
+    return json({ error: "未知操作" }, 400);
+  }
 
   if (path === "/api/tg") {
     const meta = await getMeta(env);
@@ -1499,25 +1640,35 @@ button.oks{opacity:1;background:linear-gradient(135deg,#17a35f,#2ecc7d);box-shad
       <span class="li"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></span>
       <input id="pw" type="password" name="password" placeholder="请输入访问密码" autocomplete="current-password" autofocus>
     </div>
+    <div class="field" id="coderow" style="display:none">
+      <span class="li"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span>
+      <input id="code" type="text" name="code" placeholder="验证器动态码 (6 位) 或恢复码" inputmode="numeric" autocomplete="one-time-code">
+    </div>
     <button id="go" type="submit">登 录</button>
     <div class="err" id="err"></div>
     <div class="foot"><a href="https://github.com/eooce/cloudflare-tunnel-panel" target="_blank" rel="noopener noreferrer">${CF_LOGO} Cloudflare Tunnel Panel</a></div>
   </form>
 </div>
 <script>
-var f=document.getElementById('f'),pw=document.getElementById('pw'),go=document.getElementById('go'),err=document.getElementById('err');
+var f=document.getElementById('f'),pw=document.getElementById('pw'),go=document.getElementById('go'),err=document.getElementById('err'),coderow=document.getElementById('coderow'),code=document.getElementById('code');
 f.addEventListener('submit',async function(e){
   e.preventDefault();
   if(!pw.value){err.textContent='⚠ 请输入密码';pw.focus();return}
   go.disabled=true;go.textContent='登录中...';err.textContent='';
   try{
-    var r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw.value})});
+    var body={password:pw.value};
+    if(coderow.style.display!=='none'&&code.value)body.code=code.value;
+    var r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     var d=await r.json().catch(function(){return {}});
-    if(!r.ok)throw new Error(d.error||'登录失败');
+    if(!r.ok){
+      if(d.error==='need_totp'){coderow.style.display='';err.textContent='⚠ 已开启双重验证, 请输入验证器 App 上的 6 位动态码 (或恢复码)';go.disabled=false;go.textContent='登 录';code.focus();return}
+      throw new Error(d.error||'登录失败');
+    }
     go.textContent='✓ 登录成功';go.classList.add('oks');
     location.replace('/');
   }catch(ex){
-    err.textContent='⚠ '+(ex.message||'登录失败');go.disabled=false;go.textContent='登 录';pw.select();
+    err.textContent='⚠ '+(ex.message||'登录失败');go.disabled=false;go.textContent='登 录';
+    if(coderow.style.display!=='none')code.select();else pw.select();
   }
 });
 </script></body></html>`;
@@ -1839,6 +1990,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
       <a data-v="tunnels"><span class="i"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19a4.5 4.5 0 1 0-.42-8.98 6 6 0 1 0-11.06 3.1A3.5 3.5 0 0 0 6.5 19Z"/><path d="M9 12v4"/><path d="m9 12 6-3"/><circle cx="15" cy="9" r=".8" fill="currentColor" stroke="none"/></svg></span>Tunnel 管理</a>
       <a data-v="cdn"><span class="i"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14.5 14.5 0 0 1 0 18M12 3a14.5 14.5 0 0 0 0 18"/></svg></span>CDN 回源</a>
       <a data-v="tg"><span class="i"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg></span>Telegram 配置</a>
+      <a data-v="sec"><span class="i"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></svg></span>安全设置</a>
     </nav>
     <div class="foot"><a href="#" id="logout"><span class="i"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M5 21c0-3.9 3.1-7 7-7s7 3.1 7 7"/></svg></span><span class="lt">退出登录</span><span class="lo">⇥</span></a></div>
   </aside>
@@ -1969,6 +2121,18 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
             也可用环境变量 <code>TG_BOT_TOKEN</code> 作为兜底 Token。<br>
             6. 暂停推送期间状态仍照常检查和记录, 只是暂时不发送 Telegram 消息。
           </div>
+        </div>
+      </section>
+
+      <section class="view" id="v-sec">
+        <div class="card">
+          <h3><span>登录双重验证</span><span class="pill" id="totp_state">-</span></h3>
+          <div class="hint">开启后登录需要密码 + 验证器 App 上的 6 位动态码（前后 30 秒内都有效）。验证器 App 可用 Google Authenticator、Microsoft Authenticator 等，选“手动输入”粘贴密钥即可添加。</div>
+          <div id="totp_body"><div class="empty">加载中...</div></div>
+        </div>
+        <div class="card">
+          <h3>紧急关闭</h3>
+          <div class="hint">万一手机和恢复码都丢了：在 Worker 后台的环境变量里加 TOTP_DISABLED=1 并重新部署，登录即恢复为仅密码（恢复后记得删掉这个变量并重新开启双重验证）。也可以用环境变量 TOTP_SECRET 直接指定密钥，此时面板内无法开关。</div>
         </div>
       </section>
 
@@ -2202,6 +2366,7 @@ $('acc_sel').addEventListener('change',async function(){
     metaCache={}; // 新账号路由缓存清空
     await Promise.all([loadList(),initZones()]); // 列表 + 域名下拉都随账号刷新
     if(curView==='cdn')loadCdn();
+  if(curView==='sec')loadTotp();
   }finally{setBusy(false)}
   loadTg();
   loadMeta();
@@ -2309,12 +2474,12 @@ function show(v){
   curView=v;
   document.querySelectorAll('.nav a').forEach(function(a){a.className=a.dataset.v===v?'on':''});
   document.querySelectorAll('.view').forEach(function(s){s.className='view'+(s.id==='v-'+v?' on':'')});
-  $('ttl').textContent=({dash:'仪表板',tunnels:'Tunnel 管理',cdn:'CDN 回源',tg:'Telegram 配置'})[v]||'';
+  $('ttl').textContent=({dash:'仪表板',tunnels:'Tunnel 管理',cdn:'CDN 回源',tg:'Telegram 配置',sec:'安全设置'})[v]||'';
   $('sidenav').className='sidenav';
   applyFit();
 }
 window.addEventListener('resize',applyFit);
-document.querySelectorAll('.nav a').forEach(function(a){a.onclick=function(){show(a.dataset.v);if(a.dataset.v==='cdn')loadCdn()}});
+document.querySelectorAll('.nav a').forEach(function(a){a.onclick=function(){show(a.dataset.v);if(a.dataset.v==='cdn')loadCdn();if(a.dataset.v==='sec')loadTotp()}});
 $('brandHome').onclick=function(){show('dash');location.hash=''};
 $('menu').onclick=function(){$('sidenav').className='sidenav open'};
 $('logout').onclick=async function(e){
@@ -2951,12 +3116,85 @@ document.addEventListener('click',async function(e){
   }
 });
 
+/* ---- 安全设置 (TOTP 双重验证) ---- */
+async function loadTotp(){
+  try{
+    var d=await api('/api/totp',{action:'status'});
+    $('totp_state').textContent=d.enabled?'已开启':(d.envDisabled?'已被环境变量关闭':'未开启');
+    var h='';
+    if(d.envDisabled){
+      h='<div class="hint">当前已被环境变量 TOTP_DISABLED 关闭，登录只需密码。删掉该变量并重新部署后可重新开启。</div>';
+    }else if(d.source==='env'){
+      h='<div class="hint">当前由环境变量 TOTP_SECRET 控制，登录需要密码 + 动态码；面板内无法开关，改变量并重新部署即生效。</div>';
+    }else if(d.enabled){
+      h='<div class="hint">已开启，剩余恢复码 '+(d.recoveryLeft||0)+' 张（恢复码用一张少一张）。</div>'+
+        '<div class="btns"><button class="btn gray" id="totp_off_btn">关闭双重验证</button><button class="btn gray" id="totp_regen_btn">重新生成恢复码</button></div>'+
+        '<div id="totp_act"></div>';
+    }else{
+      h='<div class="hint">未开启。点“生成密钥”，把密钥加到验证器 App，再输入 App 上的 6 位码验证通过才算开启（防抄错密钥把自己锁外面）。</div>'+
+        (d.pending?'<div class="hint">上次生成的密钥还没验证，重新生成会覆盖。</div>':'')+
+        '<div class="btns"><button class="btn" id="totp_setup_btn">生成密钥</button></div>'+
+        '<div id="totp_act"></div>';
+    }
+    $('totp_body').innerHTML=h;
+    var sb=$('totp_setup_btn');
+    if(sb)sb.onclick=totpSetup;
+    var ob=$('totp_off_btn');
+    if(ob)ob.onclick=function(){totpAskCode('disable')};
+    var rb=$('totp_regen_btn');
+    if(rb)rb.onclick=function(){totpAskCode('regen')};
+  }catch(e){$('totp_body').innerHTML='<div class="empty">加载失败</div>';fail(e)}
+}
+function totpAskCode(action){
+  $('totp_act').innerHTML='<label>验证器动态码 (或恢复码)</label><input id="totp_code" inputmode="numeric" autocomplete="off" placeholder="6 位动态码或恢复码">'+
+    '<div class="btns"><button class="btn" id="totp_act_go">确认</button><button class="btn gray" id="totp_act_cancel">取消</button></div>';
+  $('totp_act_cancel').onclick=function(){loadTotp()};
+  $('totp_act_go').onclick=async function(){
+    var code=$('totp_code').value.trim();
+    if(!code){toast('请填写动态码','err');return}
+    try{
+      if(action==='disable'){await api('/api/totp',{action:'disable',code:code});toast('双重验证已关闭');loadTotp();}
+      else{
+        var d=await api('/api/totp',{action:'regen',code:code});
+        totpShowRecovery(d.recovery,'新的恢复码（请保存，关闭后不再显示）');
+      }
+    }catch(e){fail(e)}
+  };
+}
+async function totpSetup(){
+  try{
+    var d=await api('/api/totp',{action:'setup'});
+    $('totp_act').innerHTML='<label>密钥（在验证器 App 里选手动输入，粘贴此密钥）</label>'+
+      '<input id="totp_secret" readonly value="'+esc(d.secret)+'">'+
+      '<div class="hint">手机上也可以直接点这个链接添加：<a href="'+esc(d.otpauth)+'">添加到验证器 App</a></div>'+
+      '<label>验证器 App 上的 6 位码</label><input id="totp_code" inputmode="numeric" autocomplete="off" placeholder="6 位动态码">'+
+      '<div class="btns"><button class="btn" id="totp_verify_go">验证并开启</button><button class="btn gray" id="totp_verify_cancel">取消</button></div>';
+    $('totp_verify_cancel').onclick=function(){loadTotp()};
+    $('totp_verify_go').onclick=async function(){
+      var code=$('totp_code').value.trim();
+      if(!code){toast('请填写动态码','err');return}
+      try{
+        var r=await api('/api/totp',{action:'verify_setup',code:code});
+        totpShowRecovery(r.recovery,'双重验证已开启！恢复码（请保存，关闭后不再显示）');
+      }catch(e){fail(e)}
+    };
+  }catch(e){fail(e)}
+}
+function totpShowRecovery(codes,title){
+  $('totp_body').innerHTML='<div class="hint">'+title+'</div>'+
+    '<div class="hint" style="font-size:15px;line-height:2">'+codes.map(function(c){return '<b>'+esc(c.slice(0,4))+' '+esc(c.slice(4))+'</b>'}).join('<br>')+'</div>'+
+    '<div class="hint">恢复码在登录时可代替动态码，每张只能用一次。手机丢了就用恢复码登录，再重新设置。</div>'+
+    '<div class="btns"><button class="btn" id="totp_saved_btn">我已保存</button></div>';
+  $('totp_saved_btn').onclick=function(){loadTotp()};
+}
+
 /* ---- 启动 ---- */
 show((location.hash||'').replace('#','')||'dash');
 initZones().catch(function(){}).then(loadAccs).then(function(){
   loadList().then(loadMeta);
   loadTg();
   if(curView==='cdn')loadCdn();
+  if(curView==='sec')loadTotp();
 });
 if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js',{scope:'/'}).catch(function(){});
 </script></body></html>`;
