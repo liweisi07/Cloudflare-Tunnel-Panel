@@ -733,7 +733,9 @@ async function runChecks(env, list) {
     tunnels,
     total: tunnels.length,
     online: tunnels.filter((t) => t.up).length,
-    offline: tunnels.filter((t) => !t.up).length,
+    degraded: tunnels.filter((t) => t.status === "degraded").length,
+    offline: tunnels.filter((t) => t.status === "down").length,
+    inactive: tunnels.filter((t) => t.status === "inactive").length,
     kv: !!kv,
     alertOn: {},
     alert: { sent: 0, error: "", last: 0, paused: false },
@@ -769,7 +771,7 @@ async function runChecks(env, list) {
   await storePut(env, watchKey, { at: now });
 
   if (changedAll.length)
-    await Promise.all(changedAll.map((t) => logAct(env, accScope, t.up ? "on" : "off", t.name)));
+    await Promise.all(changedAll.map((t) => logAct(env, accScope, t.up ? "on" : (t.status === "degraded" ? "deg" : "off"), t.name)));
 
   if (!changed.length) return result;
   if (result.alert.paused) {
@@ -783,7 +785,7 @@ async function runChecks(env, list) {
   }
   // 消息样式: 标题行 + 空行 + 每条变化一行 + 时间行
   const text = "📣 Argo Control 通知\n\n" +
-    changed.map((t) => (t.up ? "🟢 隧道恢复: " : "🔴 隧道离线: ") + t.name).join("\n") +
+    changed.map((t) => (t.up ? "🟢 隧道恢复: " : (t.status === "degraded" ? "🟡 隧道降级: " : "🔴 隧道离线: ")) + t.name).join("\n") +
     "\n🕒 " + fmtT(now);
   for (const id of targets) {
     const r = await tgSend(env, id, text, meta.botToken);
@@ -1798,7 +1800,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
 .spin{width:14px;height:14px;border:2px solid rgba(255,255,255,.5);border-top-color:#fff;border-radius:50%;animation:r .7s linear infinite;display:inline-block}
 .btn.gray .spin,.btn.sm .spin,.busy .spin{border-color:var(--line);border-top-color:var(--brand)}
 @keyframes r{to{transform:rotate(360deg)}}
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:14px}
+.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-bottom:14px}
 /* 仪表板两栏: 左侧隧道状态较窄, 右侧堆叠(域名分布+最近活动+项目链接), 高度与左卡对齐 */
 .dash-cols{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(320px,1fr);gap:14px;align-items:stretch}
 .dash-right{display:flex;flex-direction:column;min-width:0}
@@ -1849,10 +1851,11 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
 .stat .ic.all{background:rgba(59,130,246,.13);color:#3b82f6}
 .stat .ic.up{background:rgba(34,160,107,.13);color:var(--ok)}
 .stat .ic.down{background:rgba(232,163,23,.16);color:var(--warn)}
+.stat .ic.deg{background:rgba(232,163,23,.16);color:var(--warn)}
 .stat .ic.acc{background:rgba(139,92,246,.14);color:#8b5cf6}
 .stat .k{font-size:13px;color:var(--sub);margin-top:12px}
 .stat .v{font-size:32px;font-weight:800;line-height:1.1;font-variant-numeric:tabular-nums;letter-spacing:-.5px;margin-top:4px}
-.stat.on .v{color:var(--ok)}.stat.off .v{color:var(--bad)}.stat.acc .v{color:#8b5cf6}
+.stat.on .v{color:var(--ok)}.stat.off .v{color:var(--bad)}.stat.acc .v{color:#8b5cf6}.stat.deg .v{color:var(--warn)}
 .code{margin-top:0;position:relative}
 .code pre{margin:0;padding:12px;background:var(--code);color:var(--codet);border-radius:10px;font-size:12.5px;line-height:1.5;white-space:pre-wrap;word-break:break-all;max-height:150px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;cursor:pointer;transition:box-shadow .15s}
 .code pre:hover{box-shadow:0 0 0 1px var(--brand)}
@@ -2013,6 +2016,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
         <div class="stats">
           <div class="stat"><div class="ic all"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="5" rx="1.5"/><rect x="3" y="16" width="6" height="5" rx="1.5"/><rect x="15" y="16" width="6" height="5" rx="1.5"/><path d="M12 8v3.5M12 11.5H6V16M12 11.5h6V16"/></svg></div><div class="k">总 Tunnel</div><div class="v" id="s_all">-</div></div>
           <div class="stat on"><div class="ic up"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></div><div class="k">在线 Tunnel</div><div class="v" id="s_on">-</div></div>
+          <div class="stat deg"><div class="ic deg"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v4"/><circle cx="12" cy="16" r=".6" fill="currentColor" stroke="none"/></svg></div><div class="k">降级 Tunnel</div><div class="v" id="s_deg">-</div></div>
           <div class="stat off"><div class="ic down"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 4.2 2.9 17a2 2 0 0 0 1.7 3h14.8a2 2 0 0 0 1.7-3L13.7 4.2a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4.5"/><circle cx="12" cy="17" r=".6" fill="currentColor" stroke="none"/></svg></div><div class="k">离线 Tunnel</div><div class="v" id="s_off">-</div></div>
           <div class="stat acc"><div class="ic acc"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14.5 14.5 0 0 1 0 18M12 3a14.5 14.5 0 0 0 0 18"/></svg></div><div class="k">账户总数</div><div class="v" id="s_acc">-</div></div>
         </div>
@@ -2527,7 +2531,7 @@ function actTime(ms){
 function renderAct(list){
   var box=$('acts');list=list||[];
   if(!list.length){box.innerHTML='<div class="empty">暂无活动记录<br><span style="font-size:11.5px">创建/删除隧道、隧道上下线会显示在这里</span></div>';return}
-  var K={add:['创建','var(--ok)'],del:['删除','var(--bad)'],off:['离线','var(--bad)'],on:['恢复在线','var(--ok)']};
+  var K={add:['创建','var(--ok)'],del:['删除','var(--bad)'],off:['离线','var(--bad)'],deg:['降级','var(--warn)'],on:['恢复在线','var(--ok)']};
   box.innerHTML=list.slice(0,4).map(function(a){
     var k=K[a.k]||['事件','var(--sub)'];
     return '<div class="act"><span class="ad" style="background:'+k[1]+'"></span>'+
@@ -2536,7 +2540,7 @@ function renderAct(list){
   }).join('');
 }
 function renderDash(d){
-  $('s_on').textContent=d.online;$('s_off').textContent=d.offline;$('s_all').textContent=d.total;
+  $('s_on').textContent=d.online;$('s_deg').textContent=d.degraded||0;$('s_off').textContent=d.offline;$('s_all').textContent=d.total;
   $('s_acc').textContent=Math.max(1,Object.keys(accNames).length); // 账户总数 (loadAccs 已填充)
   renderAct(d.activity);
   var pill=$('alert_state');
@@ -2556,7 +2560,7 @@ function renderDash(d){
 /* ---- 隧道列表 + 搜索 ---- */
 var allTunnels=[],allAlertOn={},metaCache={},upTs={};
 function setSum(d){
-  $('sum').innerHTML='共 <b>'+d.total+'</b> · 在线 <b>'+d.online+'</b> · 离线 <b>'+d.offline+'</b>';
+  $('sum').innerHTML='共 <b>'+d.total+'</b> · 在线 <b>'+d.online+'</b> · 降级 <b>'+(d.degraded||0)+'</b> · 离线 <b>'+d.offline+'</b>'+(d.inactive?(' · 未启用 <b>'+d.inactive+'</b>'):'');
 }
 function filtered(){
   var q=$('q').value.trim().toLowerCase();
