@@ -1244,6 +1244,30 @@ async function handleApi(request, env, path) {
       return json({ ok: true, record: { id: rec.id, type: rec.type, name: rec.name, content: rec.content, proxied: !!rec.proxied } });
     }
 
+    if (action === "dns_edit") {
+      const recordId = str(d.recordId);
+      if (!recordId) return json({ error: "缺少记录 ID" }, 400);
+      const type = str(d.type).toUpperCase();
+      const sub = str(d.sub).replace(/\.$/, "");
+      const zone = await cf(env, `/zones/${zoneId}`);
+      const name = sub ? `${sub}.${zone.name}` : zone.name;
+      const content = str(d.content);
+      if (type !== "A" && type !== "CNAME") return json({ error: "解析类型仅支持 A / CNAME" }, 400);
+      if (!content) return json({ error: "请填写记录值" }, 400);
+      if (type === "A" && !/^\d{1,3}(\.\d{1,3}){3}$/.test(content)) return json({ error: "A 记录值应为 IPv4 地址" }, 400);
+      if (type === "CNAME" && !/^[A-Za-z0-9.-]+\.[A-Za-z0-9.-]+$/.test(content)) return json({ error: "CNAME 记录值应为域名" }, 400);
+      const exist = await cf(env, `/zones/${zoneId}/dns_records?type=${type}&name=${encodeURIComponent(name)}`);
+      if ((Array.isArray(exist) ? exist : []).some((r) => r.id !== recordId)) return json({ error: "该域名已有同类型 DNS 记录, 请先删除再添加" }, 400);
+      const rec = await cf(env, `/zones/${zoneId}/dns_records/${recordId}`, "PUT", {
+        type,
+        name,
+        content,
+        proxied: d.proxied !== false && d.proxied !== "0" && d.proxied !== 0,
+        ttl: 1,
+      });
+      return json({ ok: true, record: { id: rec.id, type: rec.type, name: rec.name, content: rec.content, proxied: !!rec.proxied } });
+    }
+
     if (action === "dns_del") {
       if (!str(d.recordId)) return json({ error: "缺少记录 ID" }, 400);
       await cf(env, `/zones/${zoneId}/dns_records/${str(d.recordId)}`, "DELETE");
@@ -1296,6 +1320,49 @@ async function handleApi(request, env, path) {
           rules: [rule],
         });
       }
+      return json({ ok: true, rules: (saved.rules || []).map(cdnRuleView) });
+    }
+
+    if (action === "origin_edit") {
+      const ruleId = str(d.ruleId);
+      if (!ruleId) return json({ error: "缺少规则 ID" }, 400);
+      const hostStr = str(d.host).toLowerCase().replace(/\.$/, "");
+      const portStr = str(d.port);
+      const originHost = str(d.originHost).toLowerCase().replace(/\.$/, "");
+      let port = null;
+      if (portStr) {
+        if (!/^\d+$/.test(portStr)) return json({ error: "端口格式不正确" }, 400);
+        port = parseInt(portStr, 10);
+        if (!port || port < 1 || port > 65535) return json({ error: "端口格式不正确" }, 400);
+      }
+      if (!port && !originHost) return json({ error: "端口和回源主机至少填一个" }, 400);
+      const { entry, full, rules } = await cdnOriginFull(env, zoneId);
+      if (!entry) return json({ error: "规则不存在" }, 404);
+      const idx = rules.findIndex((r) => r.id === ruleId);
+      if (idx < 0) return json({ error: "规则不存在" }, 404);
+      const old = rules[idx];
+      let expression = old.expression, desc = old.description || "";
+      if (hostStr) {
+        if (hostStr.startsWith("*.")) {
+          const base = hostStr.slice(2);
+          if (!/^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/.test(base)) return json({ error: "泛域名格式不正确, 例如 *.example.com" }, 400);
+          expression = `ends_with(http.host, ".${base}")`;
+        } else {
+          if (!/^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/.test(hostStr)) return json({ error: "域名格式不正确" }, 400);
+          expression = `http.host eq "${hostStr}"`;
+        }
+        if (rules.some((r, i) => i !== idx && cdnParseExpr(r.expression || "").host === hostStr))
+          return json({ error: "该域名已有回源规则, 请先删除再添加" }, 400);
+        desc = `面板CDN回源: ${hostStr} → ${port || "仅改主机"}`;
+      }
+      const origin = {};
+      if (port) origin.port = port;
+      if (originHost) origin.host = originHost;
+      const edited = { ...old, description: desc, expression, action_parameters: { origin } };
+      const body = { rules: rules.map((r, i) => cdnRuleSend(i === idx ? edited : r)) };
+      if (full.name) body.name = full.name;
+      if (full.description) body.description = full.description;
+      const saved = await cf(env, `/zones/${zoneId}/rulesets/${entry.id}`, "PUT", body);
       return json({ ok: true, rules: (saved.rules || []).map(cdnRuleView) });
     }
 
@@ -1839,7 +1906,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
           <select id="cdn_zone" class="zone"></select>
           <div id="cdn_dns" class="rtable"><div class="empty">请选择域名</div></div>
           <div style="border-top:1px solid var(--line);margin-top:12px;padding-top:4px">
-            <div class="hint" style="margin-top:8px;font-weight:600;color:var(--text)">新增解析</div>
+            <div class="hint" id="cdn_dns_form_title" style="margin-top:8px;font-weight:600;color:var(--text)">新增解析</div>
             <label>子域名 (可空, 如 cdn)</label>
             <input id="cdn_sub" placeholder="留空则解析到域名本身" autocapitalize="off" autocomplete="off">
             <label>类型 / 记录值</label>
@@ -1848,7 +1915,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
               <input id="cdn_content" class="sub" placeholder="A 填 VPS 的 IPv4, CNAME 填目标域名" autocapitalize="off" autocomplete="off" spellcheck="false">
             </div>
             <label style="display:flex;gap:8px;align-items:center;margin-top:10px;font-weight:400"><input type="checkbox" id="cdn_proxied" checked style="width:auto"> 小黄云代理 (走 CDN, 回源规则必需)</label>
-            <div class="btns"><button class="btn" id="cdn_dns_add">＋ 添加解析</button></div>
+            <div class="btns"><button class="btn" id="cdn_dns_add">＋ 添加解析</button><button class="btn gray" id="cdn_dns_cancel" style="display:none">取消编辑</button></div>
           </div>
         </div>
         <div class="card">
@@ -1856,14 +1923,14 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
           <div class="hint">令牌需加 Zone → Origin → Edit 权限。泛域名用 *.example.com, 匹配该域名下所有子域名。端口默认 8080, 即 sing-box 的 nginx_pt。</div>
           <div id="cdn_rules" class="rtable"><div class="empty">请选择域名</div></div>
           <div style="border-top:1px solid var(--line);margin-top:12px;padding-top:4px">
-            <div class="hint" style="margin-top:8px;font-weight:600;color:var(--text)">新增规则</div>
+            <div class="hint" id="cdn_rule_form_title" style="margin-top:8px;font-weight:600;color:var(--text)">新增规则</div>
             <label>匹配域名 (支持 *.example.com 泛域名)</label>
             <input id="cdn_host" placeholder="如 cdn.example.com 或 *.example.com" autocapitalize="off" autocomplete="off" spellcheck="false">
             <label>回源端口</label>
             <input id="cdn_port" placeholder="8080" inputmode="numeric" autocomplete="off">
             <label>回源主机 (可选, 留空=只改端口)</label>
             <input id="cdn_ohost" placeholder="留空则只改端口, 不改回源主机" autocapitalize="off" autocomplete="off" spellcheck="false">
-            <div class="btns"><button class="btn" id="cdn_rule_add">＋ 添加规则</button></div>
+            <div class="btns"><button class="btn" id="cdn_rule_add">＋ 添加规则</button><button class="btn gray" id="cdn_rule_cancel" style="display:none">取消编辑</button></div>
           </div>
         </div>
       </section>
@@ -2751,58 +2818,93 @@ try{savedTheme=localStorage.getItem('theme')||''}catch(e){}
 applyTheme(savedTheme);
 
 /* ---- CDN 回源 ---- */
+var cdnDnsList=[],cdnRuleList=[];
 async function loadCdn(){
   var z=$('cdn_zone').value;
   if(!z){$('cdn_dns').innerHTML='<div class="empty">请选择域名</div>';$('cdn_rules').innerHTML='<div class="empty">请选择域名</div>';return}
+  resetCdnDnsForm();resetCdnRuleForm();
   $('cdn_dns').innerHTML='<div class="empty">加载中...</div>';
   $('cdn_rules').innerHTML='<div class="empty">加载中...</div>';
   try{
     var d=await api('/api/cdn',{action:'dns_list',zoneId:z});
-    $('cdn_dns').innerHTML=(d.records||[]).map(function(r){
+    cdnDnsList=d.records||[];
+    $('cdn_dns').innerHTML=cdnDnsList.map(function(r){
       return '<div class="rt">'+
         '<div class="rh"><b>'+esc(r.type)+'</b> '+esc(r.name)+' → '+esc(r.content)+'</div>'+
         '<div class="rs">'+(r.proxied?'已代理':'仅 DNS')+'</div>'+
+        '<button class="btn sm" data-cdnedit="'+esc(r.id)+'">编辑</button>'+
         '<button class="btn sm red" data-cdndel="'+esc(r.id)+'">删除</button>'+
         '</div>';
     }).join('')||'<div class="empty">该域名下暂无解析记录</div>';
   }catch(e){$('cdn_dns').innerHTML='<div class="empty">加载失败</div>';fail(e)}
   try{
     var d2=await api('/api/cdn',{action:'origin_list',zoneId:z});
-    $('cdn_rules').innerHTML=(d2.rules||[]).map(function(r){
+    cdnRuleList=d2.rules||[];
+    $('cdn_rules').innerHTML=cdnRuleList.map(function(r){
       return '<div class="rt">'+
         '<div class="rh"><b>'+esc(r.host||r.expression)+'</b></div>'+
         '<div class="rs">端口 '+(r.port==null?'(仅改主机)':esc(r.port))+(r.originHost?' · '+esc(r.originHost):'')+'</div>'+
+        '<button class="btn sm" data-cdnredit="'+esc(r.id)+'">编辑</button>'+
         '<button class="btn sm red" data-cdnrdel="'+esc(r.id)+'">删除</button>'+
         '</div>';
     }).join('')||'<div class="empty">暂无回源规则</div>';
   }catch(e){$('cdn_rules').innerHTML='<div class="empty">加载失败</div>';fail(e)}
 }
 $('cdn_zone').addEventListener('change',loadCdn);
+var cdnEditDnsId='';
+function resetCdnDnsForm(){
+  cdnEditDnsId='';
+  $('cdn_dns_form_title').innerHTML='新增解析';
+  $('cdn_dns_add').innerHTML='＋ 添加解析';
+  $('cdn_dns_cancel').style.display='none';
+  $('cdn_sub').value='';$('cdn_content').value='';$('cdn_type').value='A';$('cdn_proxied').checked=true;
+}
+$('cdn_dns_cancel').onclick=resetCdnDnsForm;
 $('cdn_dns_add').onclick=async function(){
   var b=this,z=$('cdn_zone').value;
   if(!z){toast('请先选择域名','err');return}
   if(!$('cdn_content').value.trim()){toast('请填写记录值','err');return}
-  b.disabled=true;b.innerHTML='<span class="spin"></span> 添加中';
+  b.disabled=true;b.innerHTML='<span class="spin"></span> '+(cdnEditDnsId?'保存中':'添加中');
   try{
-    await api('/api/cdn',{action:'dns_add',zoneId:z,sub:$('cdn_sub').value.trim(),type:$('cdn_type').value,content:$('cdn_content').value.trim(),proxied:$('cdn_proxied').checked});
-    toast('解析已添加');
-    $('cdn_sub').value='';$('cdn_content').value='';
+    if(cdnEditDnsId){
+      await api('/api/cdn',{action:'dns_edit',zoneId:z,recordId:cdnEditDnsId,sub:$('cdn_sub').value.trim(),type:$('cdn_type').value,content:$('cdn_content').value.trim(),proxied:$('cdn_proxied').checked});
+      toast('解析已修改');
+    }else{
+      await api('/api/cdn',{action:'dns_add',zoneId:z,sub:$('cdn_sub').value.trim(),type:$('cdn_type').value,content:$('cdn_content').value.trim(),proxied:$('cdn_proxied').checked});
+      toast('解析已添加');
+    }
+    resetCdnDnsForm();
     loadCdn();
   }catch(e){fail(e)}
-  b.disabled=false;b.innerHTML='＋ 添加解析';
+  b.disabled=false;b.innerHTML=cdnEditDnsId?'保存修改':'＋ 添加解析';
 };
+var cdnEditRuleId='';
+function resetCdnRuleForm(){
+  cdnEditRuleId='';
+  $('cdn_rule_form_title').innerHTML='新增规则';
+  $('cdn_rule_add').innerHTML='＋ 添加规则';
+  $('cdn_rule_cancel').style.display='none';
+  $('cdn_host').value='';$('cdn_host').disabled=false;$('cdn_port').value='';$('cdn_ohost').value='';
+}
+$('cdn_rule_cancel').onclick=resetCdnRuleForm;
 $('cdn_rule_add').onclick=async function(){
   var b=this,z=$('cdn_zone').value;
   if(!z){toast('请先选择域名','err');return}
-  if(!$('cdn_host').value.trim()){toast('请填写匹配域名','err');return}
-  b.disabled=true;b.innerHTML='<span class="spin"></span> 添加中';
+  var hostVal=$('cdn_host').disabled?'':$('cdn_host').value.trim();
+  if(!hostVal&&!$('cdn_host').disabled){toast('请填写匹配域名','err');return}
+  b.disabled=true;b.innerHTML='<span class="spin"></span> '+(cdnEditRuleId?'保存中':'添加中');
   try{
-    await api('/api/cdn',{action:'origin_add',zoneId:z,host:$('cdn_host').value.trim(),port:$('cdn_port').value.trim(),originHost:$('cdn_ohost').value.trim()});
-    toast('回源规则已添加');
-    $('cdn_host').value='';$('cdn_port').value='';$('cdn_ohost').value='';
+    if(cdnEditRuleId){
+      await api('/api/cdn',{action:'origin_edit',zoneId:z,ruleId:cdnEditRuleId,host:hostVal,port:$('cdn_port').value.trim(),originHost:$('cdn_ohost').value.trim()});
+      toast('回源规则已修改');
+    }else{
+      await api('/api/cdn',{action:'origin_add',zoneId:z,host:hostVal,port:$('cdn_port').value.trim(),originHost:$('cdn_ohost').value.trim()});
+      toast('回源规则已添加');
+    }
+    resetCdnRuleForm();
     loadCdn();
   }catch(e){fail(e)}
-  b.disabled=false;b.innerHTML='＋ 添加规则';
+  b.disabled=false;b.innerHTML=cdnEditRuleId?'保存修改':'＋ 添加规则';
 };
 document.addEventListener('click',async function(e){
   var t=e.target.closest('[data-cdndel]');
@@ -2815,6 +2917,37 @@ document.addEventListener('click',async function(e){
   if(t2){
     if(!(await askConfirm('确定删除这条回源规则?','删除规则','删除')))return;
     try{await api('/api/cdn',{action:'origin_del',zoneId:$('cdn_zone').value,ruleId:t2.dataset.cdnrdel});toast('已删除');loadCdn()}catch(err){fail(err)}
+    return;
+  }
+  var t3=e.target.closest('[data-cdnedit]');
+  if(t3){
+    var r=cdnDnsList.filter(function(x){return x.id===t3.dataset.cdnedit})[0];
+    if(!r){toast('记录已变化, 请刷新后重试','err');return}
+    var zn=$('cdn_zone').selectedOptions[0].text,sub='';
+    if(r.name!==zn&&r.name.slice(-(zn.length+1))==='.'+zn)sub=r.name.slice(0,-(zn.length+1));
+    $('cdn_sub').value=sub;
+    $('cdn_type').value=r.type;
+    $('cdn_content').value=r.content;
+    $('cdn_proxied').checked=!!r.proxied;
+    cdnEditDnsId=r.id;
+    $('cdn_dns_form_title').innerHTML='编辑解析';
+    $('cdn_dns_add').innerHTML='保存修改';
+    $('cdn_dns_cancel').style.display='';
+    return;
+  }
+  var t4=e.target.closest('[data-cdnredit]');
+  if(t4){
+    var r=cdnRuleList.filter(function(x){return x.id===t4.dataset.cdnredit})[0];
+    if(!r){toast('规则已变化, 请刷新后重试','err');return}
+    if(r.host){$('cdn_host').value=r.host;$('cdn_host').disabled=false;}
+    else{$('cdn_host').value=r.expression;$('cdn_host').disabled=true;}
+    $('cdn_port').value=(r.port==null?'':r.port);
+    $('cdn_ohost').value=r.originHost||'';
+    cdnEditRuleId=r.id;
+    $('cdn_rule_form_title').innerHTML='编辑规则';
+    $('cdn_rule_add').innerHTML='保存修改';
+    $('cdn_rule_cancel').style.display='';
+    return;
   }
 });
 
