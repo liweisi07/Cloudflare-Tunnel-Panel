@@ -173,3 +173,7 @@ KV 有每日写入次数限制且存在最终一致延迟（写后立刻读可�
 - 隧道启动 Token（可冒充隧道接管流量）仅在登录后按需单独获取。
 - 登录密码比较使用固定时间算法，防止时序侧信道；连续失败有延时惩罚。
 - 建议同时设置 `SESSION_SECRET`，并给 Worker 域名加上 Cloudflare Access 作为第二层防护（可选）。
+
+## 致谢
+
+本面板基于原作者 eooce 的 [cloudflare-tunnel-panel](https://github.com/eooce/cloudflare-tunnel-panel) 修改而来，感谢原作者的开源工作。
