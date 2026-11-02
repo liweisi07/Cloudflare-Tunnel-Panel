@@ -212,7 +212,7 @@ function cdnRuleSend(r) {
   return o;
 }
 async function cdnOriginEntry(env, zoneId) {
-  const list = await cf(env, `/zones/${zoneId}/rulesets?per_page=100`);
+  const list = await cf(env, `/zones/${zoneId}/rulesets?per_page=50`);
   const arr = Array.isArray(list) ? list : [];
   return arr.find((r) => r.phase === "http_request_origin") || null;
 }
